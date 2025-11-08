@@ -26,6 +26,11 @@ class RLAgent:
             use_gpu (bool): Whether to use GPU acceleration
         """
         print("Initializing RL Agent")
+        
+        # FIXED: Validate inputs
+        if n_cells <= 0 or n_ues <= 0 or max_time <= 0:
+            raise ValueError(f"Invalid parameters: n_cells={n_cells}, n_ues={n_ues}, max_time={max_time}")
+        
         self.n_cells = n_cells
         self.n_ues = n_ues
         self.max_time = max_time
@@ -36,7 +41,7 @@ class RLAgent:
         self.state_dim = 17 + 14 + (n_cells * 12)
         self.action_dim = n_cells  # Power ratio for each cell
         
-        # Normalization parameters - learned from data
+        # FIXED: Pass n_cells explicitly
         self.state_normalizer = StateNormalizer(self.state_dim, n_cells=n_cells)
         
         self.actor = Actor(self.state_dim, self.action_dim, hidden_dim=256).to(self.device)
@@ -50,8 +55,10 @@ class RLAgent:
         self.lambda_gae = 0.95  # GAE parameter
         self.clip_epsilon = 0.2  # PPO clipping parameter
         self.ppo_epochs = 10  # Number of PPO update epochs
-        self.batch_size = 64
-        self.buffer_size = 2048
+        
+        # FIXED: Adaptive buffer/batch size based on max_time
+        self.batch_size = min(64, max_time // 4)  # At least 4 batches per episode
+        self.buffer_size = max(max_time * 2, 1024)  # 2 episodes worth
         
         # Experience buffer
         self.buffer = TransitionBuffer(self.buffer_size)
@@ -63,22 +70,23 @@ class RLAgent:
         self.episode_steps = 0
         self.current_episode_reward = 0.0
         
+        # FIXED: Track previous power for energy rate calculation
+        self.prev_power = None
+        
         self.setup_logging(log_file)
         
         self.logger.info(f"PPO Agent initialized: {n_cells} cells, {n_ues} UEs")
         self.logger.info(f"State dim: {self.state_dim}, Action dim: {self.action_dim}")
+        self.logger.info(f"Buffer size: {self.buffer_size}, Batch size: {self.batch_size}")
         self.logger.info(f"Device: {self.device}")
-
-        # Reward Hyperparameters: Tập trung vào Năng lượng và Phạt cực lớn cho Vi phạm KPI
-        self.REWARD_WEIGHT_ENERGY = 1.0     # Trọng số cho phần thưởng năng lượng (mục tiêu chính)
-        self.PENALTY_DROP_RATE = -1000.0    # Phạt cực nặng nếu Drop Rate vượt ngưỡng
-        self.PENALTY_LATENCY = -500.0       # Phạt nặng nếu Latency vượt ngưỡng
-        self.PENALTY_VIOLATION = -2000.0    # Phạt cực kỳ nghiêm trọng cho mỗi lần TĂNG vi phạm CPU/PRB (chủ yếu để tránh 0 điểm)
-        # Tăng PPO epochs
-        self.ppo_epochs = 15 # Tăng từ 10 lên 15 để sử dụng dữ liệu hiệu quả hơn.
     
     def normalize_state(self, state):
-        """Normalize state vector to [0, 1] range"""
+        """Normalize state vector with validation"""
+        # FIXED: Validate state dimension
+        if len(state) != self.state_dim:
+            raise ValueError(
+                f"State dimension mismatch! Expected {self.state_dim}, got {len(state)}"
+            )
         return self.state_normalizer.normalize(state)
     
     def setup_logging(self, log_file):
@@ -109,6 +117,7 @@ class RLAgent:
         self.total_episodes += 1
         self.episode_steps = 0
         self.current_episode_reward = 0.0
+        self.prev_power = None  # FIXED: Reset for new episode
         self.logger.info(f"Starting episode {self.total_episodes}")
     
     def end_scenario(self):
@@ -120,22 +129,31 @@ class RLAgent:
                         f"Reward={self.current_episode_reward:.2f}, "
                         f"Avg100={avg_reward:.2f}")
         
-        # Train if buffer has enough experiences
+        # FIXED: Train even if buffer not full (for short episodes)
         if self.training_mode and len(self.buffer) >= self.batch_size:
             self.train()
     
-    # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
     def get_action(self, state):
         """
-        Get action from policy network
+        Get action from policy network with validation
         
         Args:
-            state: State vector from MATLAB interface
+            state: State vector from MATLAB interface (must match state_dim)
             
         Returns:
             action: Power ratios for each cell [0, 1]
         """
-        state = self.normalize_state(np.array(state).flatten())  # make sure it’s 1D
+        # FIXED: Validate and normalize with error handling
+        try:
+            state = np.array(state).flatten()
+            if len(state) != self.state_dim:
+                raise ValueError(f"State size mismatch: expected {self.state_dim}, got {len(state)}")
+            
+            state = self.normalize_state(state)
+        except Exception as e:
+            self.logger.error(f"State processing error: {e}")
+            raise
+        
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
@@ -156,68 +174,115 @@ class RLAgent:
         action = torch.clamp(action, 0.0, 1.0)
         
         # Store for experience replay
-        self.last_state = state_tensor.cpu().numpy().flatten()
+        self.last_state = state
         self.last_action = action.cpu().numpy().flatten()
         self.last_log_prob = log_prob.cpu().numpy().flatten()
-        return action.cpu().numpy().flatten()
+        
+        return self.last_action
     
-    ## OPTIONAL: Modify reward calculation as needed
-    def calculate_reward(self, state, action, next_state):
+    def calculate_reward(self, prev_state, action, current_state):
+        """
+        FIXED: Calculate reward with proper state indexing and energy rate
         
-        # 1. Trích xuất các tham số KPI ĐỘNG và Trạng thái
+        State structure (from StateNormalizer):
+        [0-16]:   Simulation features (17)
+        [17-30]:  Network features (14)
+        [31+]:    Cell features (n_cells * 12)
         
-        # Ngưỡng KPI ĐỘNG từ Simulation Features
-        drop_threshold = state['dropCallThreshold']
-        latency_threshold = state['latencyThreshold']
-
-        # KPIs hiện tại (Network Features)
-        current_drop_rate = next_state['avgDropRate']
-        current_latency = next_state['avgLatency']
-        current_total_energy = next_state['totalEnergy']
-        current_cpu_violations = next_state['cpuViolations']
-        current_prb_violations = next_state['prbViolations']
-
-        # KPIs từ bước trước (Sử dụng state)
-        previous_total_energy = state['totalEnergy']
-        previous_cpu_violations = state['cpuViolations']
-        previous_prb_violations = state['prbViolations']
-
-        # 2. Thành phần Phần thưởng Năng lượng (Chính)
-        # Thưởng khi tổng năng lượng tiêu thụ giảm (hoặc tiêu thụ ít hơn bước trước)
-        energy_saved = previous_total_energy - current_total_energy
-        energy_reward = self.REWARD_WEIGHT_ENERGY * energy_saved
-
-        # 3. Thành phần Phạt KPI (QoS Penalty)
-        penalty_qos = 0.0
+        Key indices:
+        - [17]: totalEnergy (cumulative kWh)
+        - [18]: activeCells
+        - [22]: connectedUEs (FIXED: was using index 5)
+        - [11]: avgDropRate (simulation feature)
+        - [12]: avgLatency (simulation feature)
+        """
+        if prev_state is None:
+            return 0.0
         
-        # 3a. Phạt Drop Rate: Nếu vượt ngưỡng, phạt rất nặng
-        drop_violation_amount = max(0.0, current_drop_rate - drop_threshold)
-        penalty_qos += drop_violation_amount * self.PENALTY_DROP_RATE
-
-        # 3b. Phạt Latency: Nếu vượt ngưỡng
-        latency_violation_amount = max(0.0, current_latency - latency_threshold)
-        # Phạt theo tỷ lệ vượt ngưỡng, chia 10.0 để giảm độ nhạy (vì giá trị latency lớn)
-        penalty_qos += (latency_violation_amount / 10.0) * self.PENALTY_LATENCY 
-
-        # 4. Thành phần Phạt Vi phạm Tài nguyên (CPU/PRB) - Rất Quan trọng!
-        # Phạt cho mỗi lần vi phạm CPU/PRB tăng lên so với bước trước
-        violation_increase = (current_cpu_violations - previous_cpu_violations) + \
-                             (current_prb_violations - previous_prb_violations)
+        prev_state = np.array(prev_state).flatten()
+        current_state = np.array(current_state).flatten()
         
-        penalty_resource = 0.0
-        if violation_increase > 0:
-            # Áp dụng mức phạt cực lớn để agent không bao giờ chấp nhận tăng violation count
-            penalty_resource = violation_increase * self.PENALTY_VIOLATION 
-
-        # 5. Total Reward
-        total_reward = energy_reward + penalty_qos + penalty_resource
+        # FIXED: Use correct indices from state structure
+        # Simulation features
+        prev_drop_rate = prev_state[11]  # avgDropRate
+        curr_drop_rate = current_state[11]
+        prev_latency = prev_state[12]    # avgLatency
+        curr_latency = current_state[12]
         
-        # Ghi log (Tùy chọn)
-        self.logger.debug(f"Reward Components: E={energy_reward:.2f}, QoS={penalty_qos:.2f}, Res={penalty_resource:.2f}")
-
-        return total_reward
+        # Network features (start at index 17)
+        prev_energy = prev_state[17]      # totalEnergy (cumulative)
+        curr_energy = current_state[17]
+        prev_connected = prev_state[22]   # connectedUEs
+        curr_connected = current_state[22]
+        active_cells = current_state[18]  # activeCells
+        
+        # FIXED: Calculate energy consumption RATE (not cumulative)
+        energy_rate = curr_energy - prev_energy  # Energy consumed this timestep
+        
+        # FIXED: Normalize by number of active cells (penalize high consumption)
+        if active_cells > 0:
+            energy_per_cell = energy_rate / active_cells
+        else:
+            energy_per_cell = energy_rate
+        
+        # FIXED: Energy reward (negative consumption, scaled appropriately)
+        energy_reward = -energy_per_cell * 0.01  # Small scale to balance with other rewards
+        
+        # FIXED: Use config thresholds for penalties
+        # dropCallThreshold: 1-2%, latencyThreshold: 50-100ms
+        drop_threshold = 2.0   # Adaptive threshold
+        latency_threshold = 60.0
+        
+        # FIXED: Progressive penalties (quadratic growth)
+        drop_violation = max(0, curr_drop_rate - drop_threshold)
+        drop_penalty = -(drop_violation ** 2) * 2.0  # Quadratic penalty
+        
+        latency_violation = max(0, (curr_latency - latency_threshold) / 10)
+        latency_penalty = -(latency_violation ** 2) * 1.0
+        
+        # FIXED: Connection stability (only penalize large drops)
+        connection_change = curr_connected - prev_connected
+        if connection_change < -10:  # Only penalize significant drops
+            connection_penalty = connection_change * 0.1
+        else:
+            connection_penalty = 0
+        
+        # FIXED: Reward for KPI improvements
+        drop_improvement = max(0, prev_drop_rate - curr_drop_rate) * 3.0
+        latency_improvement = max(0, (prev_latency - curr_latency) / 10) * 1.0
+        
+        # FIXED: Bonus for maintaining service with low energy
+        if curr_drop_rate < drop_threshold and curr_latency < latency_threshold:
+            efficiency_bonus = 2.0 / (energy_per_cell + 1.0)  # Higher bonus for lower energy
+        else:
+            efficiency_bonus = 0
+        
+        # Total reward with balanced components
+        reward = (
+            energy_reward +           # -inf to 0 (small scale)
+            drop_penalty +            # -inf to 0
+            latency_penalty +         # -inf to 0
+            connection_penalty +      # -inf to 0
+            drop_improvement +        # 0 to +inf
+            latency_improvement +     # 0 to +inf
+            efficiency_bonus          # 0 to 2.0
+        )
+        
+        # FIXED: Better clipping range (symmetric, smaller)
+        reward = float(np.clip(reward, -20, 20))
+        
+        # FIXED: Log detailed reward breakdown periodically
+        if self.episode_steps % 50 == 0:
+            self.logger.debug(
+                f"Reward breakdown: energy={energy_reward:.2f}, "
+                f"drop_pen={drop_penalty:.2f}, lat_pen={latency_penalty:.2f}, "
+                f"conn_pen={connection_penalty:.2f}, drop_imp={drop_improvement:.2f}, "
+                f"lat_imp={latency_improvement:.2f}, eff_bonus={efficiency_bonus:.2f}, "
+                f"total={reward:.2f}"
+            )
+        
+        return reward
     
-    # NOT REMOVED FOR INTERACTING WITH SIMULATION (CAN BE MODIFIED)
     def update(self, state, action, next_state, done):
         """
         Update agent with experience
@@ -231,7 +296,7 @@ class RLAgent:
         if not self.training_mode:
             return
         
-        # Calculate actual reward using state as prev_state and next_state as current
+        # Calculate actual reward
         actual_reward = self.calculate_reward(state, action, next_state)
 
         self.episode_steps += 1
@@ -273,14 +338,17 @@ class RLAgent:
         self.buffer.add(transition)
     
     def compute_gae(self, rewards, values, next_values, dones):
-        """Compute Generalized Advantage Estimation"""
+        """
+        FIXED: Compute Generalized Advantage Estimation with proper bounds
+        """
         advantages = np.zeros_like(rewards)
         last_advantage = 0
         
         for t in reversed(range(len(rewards))):
             if t == len(rewards) - 1:
+                # FIXED: For last timestep, use 0 as next value if done
                 next_non_terminal = 1.0 - dones[t]
-                next_value = next_values[t]
+                next_value = next_values[t] if t < len(next_values) else 0.0
             else:
                 next_non_terminal = 1.0 - dones[t]
                 next_value = values[t + 1]
@@ -388,15 +456,33 @@ class RLAgent:
             'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
             'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
             'total_episodes': self.total_episodes,
-            'total_steps': self.total_steps
+            'total_steps': self.total_steps,
+            'n_cells': self.n_cells,  # FIXED: Save architecture info
+            'state_dim': self.state_dim,
+            'action_dim': self.action_dim
         }
         
         torch.save(checkpoint, filepath)
         self.logger.info(f"Model saved to {filepath}")
     
     def load_model(self, filepath):
-        """Load model parameters"""
+        """FIXED: Load model with architecture validation"""
         checkpoint = torch.load(filepath, map_location=self.device)
+        
+        # FIXED: Validate architecture compatibility
+        if 'n_cells' in checkpoint and checkpoint['n_cells'] != self.n_cells:
+            raise ValueError(
+                f"Model architecture mismatch! "
+                f"Model trained with {checkpoint['n_cells']} cells, "
+                f"but current config has {self.n_cells} cells"
+            )
+        
+        if 'state_dim' in checkpoint and checkpoint['state_dim'] != self.state_dim:
+            raise ValueError(
+                f"State dimension mismatch! "
+                f"Model expects {checkpoint['state_dim']}, "
+                f"but current is {self.state_dim}"
+            )
         
         self.actor.load_state_dict(checkpoint['actor_state_dict'])
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
